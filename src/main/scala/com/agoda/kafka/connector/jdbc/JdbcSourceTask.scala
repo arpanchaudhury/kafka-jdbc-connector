@@ -1,6 +1,6 @@
 package com.agoda.kafka.connector.jdbc
 
-import java.sql.{Connection, DriverManager, SQLException}
+import java.sql.SQLException
 import java.util
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -8,6 +8,7 @@ import com.agoda.kafka.connector.jdbc.models.DatabaseProduct
 import com.agoda.kafka.connector.jdbc.models.Mode.{IncrementingMode, TimestampIncrementingMode, TimestampMode}
 import com.agoda.kafka.connector.jdbc.services.{DataService, IdBasedDataService, TimeBasedDataService, TimeIdBasedDataService}
 import com.agoda.kafka.connector.jdbc.utils.{DataConverter, Version}
+import com.zaxxer.hikari.{HikariConfig, HikariDataSource}
 import org.apache.kafka.connect.errors.ConnectException
 import org.apache.kafka.connect.source.{SourceRecord, SourceTask}
 import org.slf4j.LoggerFactory
@@ -21,9 +22,9 @@ class JdbcSourceTask extends SourceTask {
   private val dataConverter = new DataConverter
 
   private var config: JdbcSourceTaskConfig  = _
-  private var db: Connection                = _
   private var dataService: DataService      = _
   private var running: AtomicBoolean        = _
+  private var dataSource: HikariDataSource  = _
 
   override def version(): String = Version.getVersion
 
@@ -40,15 +41,14 @@ class JdbcSourceTask extends SourceTask {
 
     val dbUrl = config.getConnectionUrl
     logger.debug(s"Trying to connect to $dbUrl")
-    Try(DriverManager.getConnection(dbUrl)) match {
-      case Success(c)               => db = c
-      case Failure(e: SQLException) => logger.error(s"Couldn't open connection to $dbUrl : ", e)
-                                       throw new ConnectException(e)
-      case Failure(e)               => logger.error(s"Couldn't open connection to $dbUrl : ", e)
-                                       throw e
-    }
 
-    val databaseProduct =  DatabaseProduct.withName(db.getMetaData.getDatabaseProductName)
+    val hikariConfig = new HikariConfig()
+    hikariConfig.setJdbcUrl(dbUrl)
+    hikariConfig.setMaximumPoolSize(5)
+    hikariConfig.setMaxLifetime(600000)
+    dataSource = new HikariDataSource(hikariConfig)
+
+    val databaseProduct =  DatabaseProduct.withName(dataSource.getConnection.getMetaData.getDatabaseProductName)
 
     val offset = context.offsetStorageReader().offset(
       Map(JdbcSourceConnectorConstants.STORED_PROCEDURE_NAME_KEY -> config.getStoredProcedureName).asJava
@@ -91,9 +91,9 @@ class JdbcSourceTask extends SourceTask {
   */
   override def stop(): Unit = {
     if (running != null) running.set(false)
-    if (db != null) {
+    if (dataSource != null) {
       logger.debug("Trying to close database connection")
-      Try(db.close()) match {
+      Try(dataSource.close()) match {
         case Success(_) =>
         case Failure(e) => logger.error("Failed to close database connection: ", e)
       }
@@ -109,7 +109,7 @@ class JdbcSourceTask extends SourceTask {
     logger.debug("Polling new data ...")
     val pollInterval = config.getPollInterval
     val startTime    = System.currentTimeMillis
-    val fetchedRecords = dataService.getRecords(db, pollInterval.millis) match {
+    val fetchedRecords = dataService.getRecords(dataSource.getConnection, pollInterval.millis) match {
       case Success(records)                    => if(records.isEmpty) logger.info(s"No updates for $dataService")
                                                   else logger.info(s"Returning ${records.size} records for $dataService")
                                                   records
